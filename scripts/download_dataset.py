@@ -1,6 +1,9 @@
-"""Download PlantVillage parquet shards from Hugging Face, verify SHA-256, and export an ImageFolder tree.
+"""Download PlantVillage parquet shards from Hugging Face, verify SHA-256, and export ImageFolder trees.
 
-Source: BrandonFors/Plant-Diseases-PlantVillage-Dataset (license: CC0-1.0).
+Source: BrandonFors/Plant-Diseases-PlantVillage-Dataset (license: CC0-1.0), pinned to an immutable commit.
+The official train and test splits are preserved and written to separate directories:
+  <out>/train/<class>/...
+  <out>/test/<class>/...
 Usage: python scripts/download_dataset.py --out data/raw
 """
 
@@ -14,8 +17,10 @@ import urllib.request
 from pathlib import Path
 
 REPO = "BrandonFors/Plant-Diseases-PlantVillage-Dataset"
-REVISION = "main"
+# Immutable dataset commit (Hugging Face repo sha as reported by the API). Do not change to a branch name.
+REVISION = "96bdc27bd804297b76f373cba1c935e52076e107"
 BASE_URL = f"https://huggingface.co/datasets/{REPO}/resolve/{REVISION}/"
+SPLITS = ("train", "test")
 
 # Expected SHA-256 (LFS oid) and byte size for each shard, as reported by the Hugging Face API.
 EXPECTED = {
@@ -28,6 +33,14 @@ EXPECTED = {
 }
 
 
+def split_of(rel: str) -> str:
+    """Map a shard path such as 'data/test-00000-of-00001.parquet' to its split name."""
+    split = Path(rel).name.split("-")[0]
+    if split not in SPLITS:
+        raise ValueError(f"Unrecognized split for shard: {rel}")
+    return split
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -36,14 +49,15 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def download_and_verify(dest: Path) -> list[Path]:
+def download_and_verify(dest: Path) -> dict[str, list[Path]]:
+    """Download any missing shards, verify each against EXPECTED, and group paths by split."""
     dest.mkdir(parents=True, exist_ok=True)
-    paths = []
+    by_split: dict[str, list[Path]] = {s: [] for s in SPLITS}
     for rel, (digest, size) in EXPECTED.items():
         target = dest / Path(rel).name
         if target.exists() and target.stat().st_size == size and sha256_file(target) == digest:
             print(f"ok (cached): {target.name}")
-            paths.append(target)
+            by_split[split_of(rel)].append(target)
             continue
         print(f"downloading: {rel}")
         tmp = target.with_suffix(target.suffix + ".part")
@@ -53,18 +67,33 @@ def download_and_verify(dest: Path) -> list[Path]:
                 if not chunk:
                     break
                 out.write(chunk)
-        actual = sha256_file(tmp)
-        if tmp.stat().st_size != size or actual != digest:
+        # Record the size and hash while the temp file still exists, so the error message can report them.
+        actual_size = tmp.stat().st_size
+        actual_digest = sha256_file(tmp)
+        if actual_size != size or actual_digest != digest:
             tmp.unlink()
             raise RuntimeError(
-                f"Verification failed for {rel}: size={tmp.stat().st_size} sha256={actual}")
+                f"Verification failed for {rel}: "
+                f"size={actual_size} (expected {size}), "
+                f"sha256={actual_digest} (expected {digest})")
         tmp.rename(target)
         print(f"verified: {target.name}")
-        paths.append(target)
-    return paths
+        by_split[split_of(rel)].append(target)
+    return by_split
 
 
-def export_imagefolder(parquet_paths: list[Path], out: Path) -> dict:
+def check_output_dir(out: Path) -> None:
+    """Refuse to mix the split layout with a leftover flat ImageFolder layout from older runs."""
+    if not out.exists():
+        return
+    stale = sorted(p.name for p in out.iterdir() if p.name not in set(SPLITS) | {"MANIFEST.json"})
+    if stale:
+        raise RuntimeError(
+            f"{out} contains entries from an older flat layout: {stale[:10]}. "
+            "Delete them (or choose a different --out) and rerun.")
+
+
+def export_split(parquet_paths: list[Path], out: Path) -> dict[str, int]:
     from datasets import Image as HFImage
     from datasets import load_dataset
 
@@ -88,30 +117,43 @@ def export_imagefolder(parquet_paths: list[Path], out: Path) -> dict:
         (cdir / f"{i:06d}{suffix}").write_bytes(img["bytes"])
         counts[cls] += 1
         if i % 5000 == 0:
-            print(f"exported {i} images")
+            print(f"exported {i} images to {out.name}/")
     return counts
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--out", default="data/raw", help="ImageFolder output directory")
+    parser.add_argument("--out", default="data/raw", help="Root output directory; writes train/ and test/ below it")
     parser.add_argument("--cache", default="data/downloads", help="Where parquet shards are stored")
     args = parser.parse_args()
 
     out = Path(args.out)
-    shards = download_and_verify(Path(args.cache))
-    counts = export_imagefolder(shards, out)
+    check_output_dir(out)
+    by_split = download_and_verify(Path(args.cache))
+
+    split_counts: dict[str, dict[str, int]] = {}
+    for split in SPLITS:
+        split_counts[split] = export_split(by_split[split], out / split)
 
     manifest = {
         "source": f"https://huggingface.co/datasets/{REPO}",
         "revision": REVISION,
         "license": "CC0-1.0",
-        "shards": {p.name: sha256_file(p) for p in shards},
-        "class_counts": counts,
-        "total_images": sum(counts.values()),
+        "shards": {p.name: sha256_file(p) for paths in by_split.values() for p in paths},
+        "splits": {
+            split: {
+                "class_counts": counts,
+                "total_images": sum(counts.values()),
+            }
+            for split, counts in split_counts.items()
+        },
+        "note": "The test split is the official held-out split and must not be used for training, "
+                "validation, or tuning.",
     }
     (out / "MANIFEST.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    print(f"done: {manifest['total_images']} images across {len(counts)} classes -> {out}")
+    for split in SPLITS:
+        print(f"done: {split} has {manifest['splits'][split]['total_images']} images "
+              f"across {len(split_counts[split])} classes -> {out / split}")
     return 0
 
 

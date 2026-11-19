@@ -10,10 +10,11 @@ from pydantic import BaseModel
 
 
 class DataConfig(BaseModel):
+    # Must contain train/ and test/ subdirectories (see scripts/download_dataset.py).
     root: str = "data/raw"
     image_size: int = 224
+    # Fraction of the official train split held out for validation. The official test split is fixed.
     val_split: float = 0.15
-    test_split: float = 0.15
     num_workers: int = 4
     seed: int = 42
 

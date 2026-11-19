@@ -1,4 +1,7 @@
-"""Training loop with validation, early stopping, and metric export."""
+"""Training loop with validation, early stopping, and metric export.
+
+The official test split is read only once, after training and checkpoint selection are complete.
+"""
 
 from __future__ import annotations
 
@@ -66,8 +69,7 @@ def run(cfg: AppConfig) -> dict:
     out = Path(cfg.training.output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    data = load_data(cfg.data.root, cfg.data.image_size, cfg.data.val_split,
-                     cfg.data.test_split, cfg.data.seed)
+    data = load_data(cfg.data.root, cfg.data.image_size, cfg.data.val_split, cfg.data.seed)
     nw = cfg.data.num_workers
     train_loader = DataLoader(data.train, batch_size=cfg.training.batch_size,
                               shuffle=True, num_workers=nw)
@@ -105,7 +107,7 @@ def run(cfg: AppConfig) -> dict:
                 print(f"Early stopping at epoch {epoch}")
                 break
 
-    # Final evaluation on the held-out test set using the best checkpoint.
+    # Final evaluation on the official held-out test split using the best checkpoint.
     ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["state_dict"])
     _, y_true, y_pred = evaluate(model, test_loader, device, criterion)
